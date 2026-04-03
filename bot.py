@@ -6,10 +6,8 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from dotenv import load_dotenv
 
-# GigaChat
+# --- Импорты для RAG ---
 from gigachat import GigaChat
-
-# LangChain (облегчённая версия)
 from langchain_community.document_loaders import PyPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import Chroma
@@ -30,132 +28,101 @@ bot = Bot(token=TOKEN)
 dp = Dispatcher()
 logging.basicConfig(level=logging.INFO)
 
-# Глобальные переменные
+# Глобальные переменные для базы знаний
 vectorstore = None
 qa_chain = None
-
-# Эмбеддинги (лёгкая модель)
-embeddings = HuggingFaceEmbeddings(
-    model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
-)
+embeddings = HuggingFaceEmbeddings(model_name="intfloat/multilingual-e5-small")
 
 @dp.message(Command("start"))
 async def start_command(message: types.Message):
     await message.answer(
         "🚆 **Привет! Я помощник по электропоезду ЭШ2**\n\n"
-        "Я работаю с документацией и отвечаю на вопросы.\n\n"
         "📄 **Как пользоваться:**\n"
         "• Отправьте мне PDF-файл с инструкцией\n"
         "• Я сохраню её в базу знаний\n"
         "• Задавайте любые вопросы — я найду ответ!\n\n"
-        "📖 /help — помощь\n"
-        "📊 /stats — статистика",
+        "⚠️ Если бот завис при обработке файла, отправьте его повторно.",
         parse_mode="Markdown"
     )
 
-@dp.message(Command("help"))
-async def help_command(message: types.Message):
-    await message.answer(
-        "📖 **Помощь**\n\n"
-        "1. Отправьте PDF с инструкцией по электропоезду\n"
-        "2. Я обработаю и сохраню документ\n"
-        "3. Задавайте вопросы — я ищу ответ в базе знаний\n\n"
-        "Примеры:\n"
-        "• Какое давление в тормозной системе ЭШ2?\n"
-        "• Как проверить уровень масла?\n"
-        "• Что делать при срабатывании защиты БВ?",
-        parse_mode="Markdown"
-    )
-
-@dp.message(Command("stats"))
-async def stats_command(message: types.Message):
-    if message.from_user.id not in ADMIN_IDS:
-        await message.answer("⛔ Только администратор.")
-        return
-    
-    if vectorstore is None:
-        await message.answer("📭 База знаний пуста. Загрузите PDF-документы.")
-    else:
-        await message.answer("✅ База знаний активна. Можно задавать вопросы!")
-
+# --- ОБРАБОТЧИК ДОКУМЕНТОВ С ЗАЩИТОЙ ОТ ЗАВИСАНИЙ ---
 @dp.message(lambda message: message.document)
 async def handle_document(message: types.Message):
     if message.from_user.id not in ADMIN_IDS:
         await message.answer("⛔ Только администратор может загружать документы.")
         return
-    
+
     if not message.document.file_name.endswith('.pdf'):
         await message.answer("❌ Поддерживаются только PDF-файлы.")
         return
-    
-    await message.answer(f"📥 Получаю: {message.document.file_name}...")
+
+    status_msg = await message.answer(f"📥 Получаю: {message.document.file_name}...")
     
     try:
         file = await bot.get_file(message.document.file_id)
-        
+        # Создаем временный файл
         with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp:
             await bot.download_file(file.file_path, tmp.name)
             tmp_path = tmp.name
         
-        await message.answer("🔄 Обрабатываю документ...")
-        
-        # Загрузка PDF
+        await status_msg.edit_text("🔄 Обрабатываю документ...")
+
+        # --- Обработка документа ---
         loader = PyPDFLoader(tmp_path)
         documents = loader.load()
         
-        # Разбивка на части
         text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=1000,
             chunk_overlap=200
         )
         chunks = text_splitter.split_documents(documents)
         
-        # Добавление в базу
+        # --- Работа с базой знаний ---
         global vectorstore, qa_chain
         if vectorstore is None:
-            vectorstore = Chroma.from_documents(
-                chunks, 
-                embeddings, 
-                persist_directory="/tmp/chroma_db"
-            )
+            vectorstore = Chroma.from_documents(chunks, embeddings, persist_directory="/tmp/chroma_db")
         else:
             vectorstore.add_documents(chunks)
         
-        # Создание RAG цепочки с GigaChat
-        llm = GigaChatLLM(
-            credentials=GIGA_KEY,
-            verify_ssl_certs=False,
-            model="GigaChat:latest"
-        )
-        qa_chain = RetrievalQA.from_chain_type(
-            llm=llm,
-            retriever=vectorstore.as_retriever(k=3),
-            return_source_documents=True
-        )
-        
-        await message.answer(
-            f"✅ **Документ добавлен!**\n"
-            f"📄 {message.document.file_name}\n"
-            f"📊 Разбит на {len(chunks)} фрагментов\n\n"
-            f"Теперь задавайте вопросы!",
-            parse_mode="Markdown"
-        )
-        
+        # --- Инициализация GigaChat (ПРЯМО ЗДЕСЬ) ---
+        # Это ключевой момент: пробуем подключиться к GigaChat прямо во время обработки файла.
+        try:
+            llm = GigaChatLLM(
+                credentials=GIGA_KEY,
+                scope="GIGACHAT_API_PERS",
+                verify_ssl_certs=False,
+                model="GigaChat"
+            )
+            qa_chain = RetrievalQA.from_chain_type(
+                llm=llm,
+                retriever=vectorstore.as_retriever(k=3),
+                return_source_documents=True
+            )
+            await status_msg.edit_text(f"✅ **Документ добавлен!**\n📄 {message.document.file_name}\n📊 Разбит на {len(chunks)} фрагментов\n\n🤖 GigaChat готов к вопросам!")
+        except Exception as giga_error:
+            # Если GigaChat не подключился, сообщим об этом, но документ сохраним
+            await status_msg.edit_text(f"⚠️ **Документ сохранен, но GigaChat не отвечает.**\n\nПроверьте API-ключ.\nОшибка: {str(giga_error)[:100]}")
+            logging.error(f"GigaChat init error: {giga_error}")
+
         os.unlink(tmp_path)
         
     except Exception as e:
-        await message.answer(f"❌ Ошибка: {e}")
+        await status_msg.edit_text(f"❌ Критическая ошибка при обработке: {e}")
+        logging.error(f"Document processing error: {e}")
 
+# --- ОБРАБОТЧИК ВОПРОСОВ С ЗАЩИТОЙ ---
 @dp.message()
 async def ask_question(message: types.Message):
     if qa_chain is None:
         await message.answer(
-            "📭 База знаний пуста.\n"
-            "Сначала отправьте PDF-документ с инструкцией."
+            "📭 **База знаний пуста или GigaChat не настроен.**\n\n"
+            "1. Убедитесь, что вы загрузили PDF-файл.\n"
+            "2. Проверьте, что API-ключ GigaChat введен верно (команда `/set_key`).\n"
+            "3. Попробуйте загрузить файл еще раз."
         )
         return
     
-    await message.answer("🤔 Ищу ответ...")
+    thinking_msg = await message.answer("🤔 Ищу ответ в инструкциях...")
     
     try:
         result = qa_chain.invoke({"query": message.text})
@@ -172,14 +139,14 @@ async def ask_question(message: types.Message):
                     seen.add(source_name)
                     response += f"📄 {source_name}\n"
         
-        await message.answer(response, parse_mode="Markdown")
+        await thinking_msg.edit_text(response, parse_mode="Markdown")
         
     except Exception as e:
-        await message.answer(f"❌ Ошибка: {e}")
+        await thinking_msg.edit_text(f"❌ Ошибка при поиске ответа: {e}\n\nПопробуйте перезагрузить документ командой `/start`.")
 
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
-    logging.info("🤖 Бот с GigaChat запущен!")
+    logging.info("🤖 Бот запущен!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
