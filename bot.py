@@ -8,14 +8,14 @@ from dotenv import load_dotenv
 
 # GigaChat
 from gigachat import GigaChat
-from gigachat.models import Chat, Messages, MessagesRole
 
-# LangChain для работы с документами
+# LangChain (облегчённая версия)
 from langchain_community.document_loaders import PyPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import Chroma
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain.chains import RetrievalQA
+from langchain_community.llms import GigaChat as GigaChatLLM
 
 load_dotenv()
 
@@ -30,13 +30,14 @@ bot = Bot(token=TOKEN)
 dp = Dispatcher()
 logging.basicConfig(level=logging.INFO)
 
-# Глобальная база знаний
+# Глобальные переменные
 vectorstore = None
 qa_chain = None
-embeddings = HuggingFaceEmbeddings(model_name="intfloat/multilingual-e5-small")
 
-# Подключение к GigaChat
-giga = GigaChat(credentials=GIGA_KEY, verify_ssl_certs=False)
+# Эмбеддинги (лёгкая модель)
+embeddings = HuggingFaceEmbeddings(
+    model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+)
 
 @dp.message(Command("start"))
 async def start_command(message: types.Message):
@@ -112,13 +113,20 @@ async def handle_document(message: types.Message):
         # Добавление в базу
         global vectorstore, qa_chain
         if vectorstore is None:
-            vectorstore = Chroma.from_documents(chunks, embeddings, persist_directory="/tmp/chroma_db")
+            vectorstore = Chroma.from_documents(
+                chunks, 
+                embeddings, 
+                persist_directory="/tmp/chroma_db"
+            )
         else:
             vectorstore.add_documents(chunks)
         
-        # Создание RAG цепочки
-        from langchain_community.llms import GigaChat
-        llm = GigaChat(credentials=GIGA_KEY, verify_ssl_certs=False)
+        # Создание RAG цепочки с GigaChat
+        llm = GigaChatLLM(
+            credentials=GIGA_KEY,
+            verify_ssl_certs=False,
+            model="GigaChat:latest"
+        )
         qa_chain = RetrievalQA.from_chain_type(
             llm=llm,
             retriever=vectorstore.as_retriever(k=3),
@@ -158,7 +166,7 @@ async def ask_question(message: types.Message):
         if sources:
             response += "**Источники:**\n"
             seen = set()
-            for i, doc in enumerate(sources[:3]):
+            for doc in sources[:3]:
                 source_name = doc.metadata.get('source', 'документ').split('/')[-1]
                 if source_name not in seen:
                     seen.add(source_name)
